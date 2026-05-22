@@ -12,6 +12,91 @@ This is the starter codebase for the Greenroom Applied AI PM case study.
 
 You're looking at a working but mediocre product. It's enough to feel real, but every workflow has gaps. **Your job isn't to fix everything — it's to pick a slice and design it well.** See your case study brief for full instructions.
 
+---
+
+## Phase 1 submission — Deal Sheet capture + settlement engine
+
+This fork ships the slice the case study brief asked for: an LLM-driven deal-capture flow that produces clean structured terms, paired with a settlement engine that consumes them across all five deal types. The settlement craft bet from Pri's Q4 memo, end-to-end.
+
+**Start here:**
+- **The memo:** [`docs/submission-memo.md`](docs/submission-memo.md) (or [`.docx`](docs/submission-memo.docx)) — 7-section PRD covering the slice, the alternatives I cut, the data evidence, current vs. proposed workflow, who this helps, validation, and what I'd ship next.
+- **The full spec:** [`docs/superpowers/specs/2026-05-21-llm-deal-capture-design.md`](docs/superpowers/specs/2026-05-21-llm-deal-capture-design.md) — capture + engine design with the prime directive, data model, state machine, capped-bucket schema, LLM contract, engine handlers, failure modes, validation, and source-signal traceability appendix.
+- **The supporting artifacts:** the cross-slice inventory, the engine-scope sketch (superseded by §7 of the main spec), and the extractor system prompt all live in [`docs/superpowers/specs/`](docs/superpowers/specs/).
+
+### What was built
+
+| Surface | What it does |
+|---|---|
+| `/settings/llm` | BYOK Anthropic key entry with live validation (real API call on save). Stub fallback when no key configured, so the flow never breaks. |
+| `/shows/[id]/deal/capture` | Booker view. Paste a deal email → Claude Opus 4.7 (adaptive thinking + prompt caching) extracts structured terms and flags ambiguities as plain-language questions. Resolutions write back into `deals.recoupsAtDealTimeJson` + `deductionOrderJson` as the **capped-bucket** schema. |
+| `/shows/[id]/settle` | Settlement worksheet, now consuming the new engine return shape — preliminary banner when terms aren't sealed, `linesSkipped` panel for anything the engine refused to compute, `pendingExpenses` surfaced separately. |
+| Engine ([`lib/dealMath.ts`](lib/dealMath.ts)) | Full rewrite. Handles **all five deal types** + variants (walkout, ratchet, vs-gross). Refuses to silently default — every gap surfaces as a `linesSkipped` row with provenance. Coverage went from ~38% to ~100% of past deals. |
+
+### Try the prototype — 4 demo deals prove the schema does real work
+
+After setup (instructions below), open these URLs side by side:
+
+| URL | Total to artist | What it proves |
+|---|---:|---|
+| [`/shows/show_engine_demo_inside_cap/settle`](http://localhost:3000/shows/show_engine_demo_inside_cap/settle) | **$11,964** | Same show as the next row. Recoup placed **inside** the capped bucket. |
+| [`/shows/show_engine_demo_outside_cap/settle`](http://localhost:3000/shows/show_engine_demo_outside_cap/settle) | **$11,484** | Same show. Recoup placed **outside** the cap. **$480 delta** from one JSON difference. |
+| [`/shows/show_engine_demo_walkout/settle`](http://localhost:3000/shows/show_engine_demo_walkout/settle) | $24,484 | vs + walkout pot — 100% of gross above breakeven flows to artist. |
+| [`/shows/show_engine_demo_ratchet/settle`](http://localhost:3000/shows/show_engine_demo_ratchet/settle) | $10,648 | vs + capacity-pct ratchet — base 70% net, ratchets to 80% over 80% capacity (triggered: 540 of 650 sold). |
+
+The first two are the Coastal Spell dispute (`data/dispute-thread.md`) schema-encoded. Same gross ($19,840), same expenses ($2,600), same recoup ($900). The disagreement is now categorically explicit before the show ever loads in.
+
+To walk through the capture flow end-to-end:
+
+1. Configure an Anthropic key at `/settings/llm` (key never leaves the server).
+2. Open any show and click **Capture deal terms**.
+3. Paste the Coastal Spell deal email:
+   ```
+   $5,000 vs 80% of net after expenses, whichever greater.
+   Expenses capped at $2,500. Marketing recoup of $900 against gross.
+   ```
+4. Click **Extract terms**. You'll see structured fields populated + a `recoup_placement` ambiguity card asking inside-or-outside the cap.
+5. Pick an option → the deduction order writes back as a capped_bucket JSON.
+6. Open the show's settlement page and see the math computed line-by-line with provenance.
+
+### What changed vs. the starter
+
+```
+app/
+  settings/llm/                NEW — venue BYOK config (page + form + actions)
+  shows/[id]/
+    deal/capture/              NEW — booker view (page + client + server actions)
+    page.tsx                   modified — "Capture deal terms" CTA added
+    settle/page.tsx            modified — new engine return shape consumed,
+                                preliminary banner, linesSkipped panel
+components/layout/
+  nav-links.tsx                modified — AI configuration link added
+
+db/
+  schema.ts                    modified — 4 new tables + deals extensions +
+                                ticket_sales.source + shared DeductionStep type
+  seed.ts                      modified — cascade fix + 4 engine demo deals
+
+lib/
+  dealMath.ts                  rewritten — all 5 deal types + variants +
+                                capped-bucket waterfall + new return shape
+  extraction/                  NEW — types, stub, Anthropic extractor (Opus 4.7
+                                with adaptive thinking + prompt caching),
+                                dispatcher, recoup-placement writeback
+  session.ts                   NEW — hardcoded Mariana/Crescent session
+
+docs/
+  submission-memo.md / .docx   NEW — the PRD
+  superpowers/specs/           NEW — design spec, cross-slice inventory,
+                                extractor system prompt, engine sketch
+
+scripts/
+  md-to-docx.mjs               NEW — Node converter (used to generate the .docx)
+```
+
+> ⚠️ **Note on `npm run db:reset`** — works cleanly after the cascade fix. Old `db:reset` chained `rm -f data/greenroom.db && drizzle-kit push && tsx db/seed.ts` and could leave a partial schema if the `rm` step failed (e.g., file locked on Windows). Now the seed deletes the new tables in FK-dependency order, so re-seeds against the live DB also work.
+
+---
+
 ## Before you start
 
 You'll need:
