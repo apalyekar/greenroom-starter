@@ -34,6 +34,10 @@ import {
   comps,
   expenses,
   settlements,
+  dealTermsExtraction,
+  dealAmbiguities,
+  dealConfirmations,
+  venueLlmSettings,
   type Bonus,
   type Recoup,
   type SettlementStage,
@@ -852,6 +856,14 @@ function dateOffset(days: number): string {
 async function main() {
   console.log("🌱 Seeding 18-month Greenroom dataset…");
 
+  // Delete in FK-dependency order. The four Deal Sheet tables
+  // (deal_ambiguities, deal_confirmations, deal_terms_extraction) reference
+  // deals, so they must go first. venue_llm_settings references venues + users.
+  await db.delete(dealAmbiguities);
+  await db.delete(dealConfirmations);
+  await db.delete(dealTermsExtraction);
+  await db.delete(venueLlmSettings);
+
   await db.delete(settlements);
   await db.delete(expenses);
   await db.delete(comps);
@@ -1427,6 +1439,406 @@ async function main() {
     notes:
       "Disputed by WME (Daniel Hwang) on 3/18 over the $900 marketing recoup. Marcus authorized additional $720 to resolve, but the formal revision hasn't been pushed back into the system yet. Final agreed: $12,285 (vs originally calculated $11,565). See email thread for context. Going forward: deal emails must specify marketing recoup as inside or outside expense cap.",
   });
+
+  // -------- Engine demo shows: hand-populated structured fields --------
+  //
+  // These shows exist so the settlement engine has clean test fixtures
+  // that exercise the new schema (capped_bucket deductionOrder, walkout,
+  // ratchet) without depending on the LLM extractor having produced them.
+  // They land in the future so they don't interfere with past-show settlement
+  // narratives.
+  const demoFutureBase = new Date(Date.now() + 21 * 24 * 60 * 60 * 1000); // +21 days
+  const demoDate = (offsetDays: number) => {
+    const d = new Date(demoFutureBase);
+    d.setDate(d.getDate() + offsetDays);
+    return { iso: d.toISOString().slice(0, 10), ts: d };
+  };
+
+  // Demo 1: Coastal-Spell-shape rerun with recoup placed INSIDE the cap.
+  // This is "Andrea's read" — the interpretation the historical dispute
+  // settled on. Same prose-style as Coastal Spell, but the structured
+  // fields are now unambiguous so the engine computes one definitive answer.
+  {
+    const d = demoDate(0);
+    const showId = "show_engine_demo_inside_cap";
+    const dealId = `deal_${showId}`;
+    showsToInsert.push({
+      id: showId,
+      venueId: VENUE_ID,
+      artistId: "art_coastal_spell",
+      date: d.iso,
+      status: "advanced",
+      doorsTime: "19:30",
+      setTime: "21:00",
+      roomConfig: "standing",
+      internalNotes:
+        "Engine demo: vs deal w/ marketing recoup INSIDE the expense cap. The Coastal Spell '$11,565 answer' — recoup counts against the $2,500 cap, so total venue-side deductions max $2,500.",
+      createdAt: d.ts,
+    });
+    const recoupId = "rec_marketing_demo_inside";
+    const recoups: Recoup[] = [
+      {
+        id: recoupId,
+        category: "marketing",
+        label: "Marketing recoup",
+        amount: 900,
+        status: "agreed",
+      },
+    ];
+    const deductionOrder = [
+      { kind: "line_item", id: "fees", ref: { type: "fees" } },
+      {
+        kind: "capped_bucket",
+        id: "venue_expenses",
+        capRef: "expenseCap",
+        members: [
+          {
+            kind: "line_item",
+            id: "expenses",
+            ref: { type: "all_expenses_except_recoups" },
+          },
+          {
+            kind: "line_item",
+            id: `recoup_${recoupId}`,
+            ref: { type: "recoup", recoupId },
+          },
+        ],
+      },
+      { kind: "apply_percentage", basis: "net" },
+    ];
+    dealsToInsert.push({
+      id: dealId,
+      showId,
+      dealType: "vs",
+      guaranteeAmount: 5000,
+      percentage: 0.8,
+      percentageBasis: "net",
+      expenseCap: 2500,
+      hospitalityCap: 500,
+      bonusesJson: null,
+      dealNotesFreetext:
+        "$5,000 vs 80% of net after expenses, whichever greater. Expenses capped at $2,500 (including marketing recoup). Marketing recoup $900 counts toward the cap.",
+      recoupsAtDealTimeJson: JSON.stringify(recoups),
+      deductionOrderJson: JSON.stringify(deductionOrder),
+      termsSource: "llm_extracted_then_edited",
+      termsConfirmedByVenueAt: d.ts,
+      createdAt: d.ts,
+    });
+    ticketSalesToInsert.push({
+      id: `ts_${showId}`,
+      showId,
+      qty: 620,
+      gross: 19840,
+      fees: 1984,
+      capturedAt: d.ts,
+    });
+    // Expenses are intentionally pushed ABOVE the $2,500 cap so the
+    // inside/outside readings actually diverge — proves the capped_bucket
+    // schema does real work. Non-hospitality total = $2,200.
+    for (const [idx, e] of [
+      { category: "sound" as const, amount: 600 },
+      { category: "lights" as const, amount: 400 },
+      { category: "production" as const, amount: 800 },
+      { category: "hospitality" as const, amount: 400 },
+      { category: "backline" as const, amount: 400 },
+    ].entries()) {
+      expensesToInsert.push({
+        id: `exp_${showId}_${idx}`,
+        showId,
+        category: e.category,
+        amount: e.amount,
+        description: null,
+        approved: true,
+        absorbedByVenue: false,
+        enteredByUserId: MARIANA_ID,
+        enteredAt: d.ts,
+      });
+    }
+  }
+
+  // Demo 2: Same Coastal-Spell-shape but with recoup placed OUTSIDE the cap.
+  // This is "Mariana's read" — the alternative interpretation. Side-by-side
+  // with demo 1, the engine computes a different totalToArtist on the same
+  // gross/expenses, proving the capped_bucket schema is doing real work.
+  {
+    const d = demoDate(7);
+    const showId = "show_engine_demo_outside_cap";
+    const dealId = `deal_${showId}`;
+    showsToInsert.push({
+      id: showId,
+      venueId: VENUE_ID,
+      artistId: "art_coastal_spell",
+      date: d.iso,
+      status: "advanced",
+      doorsTime: "19:30",
+      setTime: "21:00",
+      roomConfig: "standing",
+      internalNotes:
+        "Engine demo: vs deal w/ marketing recoup OUTSIDE the expense cap. The Coastal Spell '$12,285 answer' — recoup comes off gross separately, expenses capped at $2,500 on their own.",
+      createdAt: d.ts,
+    });
+    const recoupId = "rec_marketing_demo_outside";
+    const recoups: Recoup[] = [
+      {
+        id: recoupId,
+        category: "marketing",
+        label: "Marketing recoup",
+        amount: 900,
+        status: "agreed",
+      },
+    ];
+    const deductionOrder = [
+      { kind: "line_item", id: "fees", ref: { type: "fees" } },
+      {
+        kind: "line_item",
+        id: `recoup_${recoupId}`,
+        ref: { type: "recoup", recoupId },
+      },
+      {
+        kind: "capped_bucket",
+        id: "venue_expenses",
+        capRef: "expenseCap",
+        members: [
+          {
+            kind: "line_item",
+            id: "expenses",
+            ref: { type: "all_expenses_except_recoups" },
+          },
+        ],
+      },
+      { kind: "apply_percentage", basis: "net" },
+    ];
+    dealsToInsert.push({
+      id: dealId,
+      showId,
+      dealType: "vs",
+      guaranteeAmount: 5000,
+      percentage: 0.8,
+      percentageBasis: "net",
+      expenseCap: 2500,
+      hospitalityCap: 500,
+      bonusesJson: null,
+      dealNotesFreetext:
+        "$5,000 vs 80% of net after expenses, whichever greater. Expenses capped at $2,500 separately. Marketing recoup of $900 against gross (outside the expense cap).",
+      recoupsAtDealTimeJson: JSON.stringify(recoups),
+      deductionOrderJson: JSON.stringify(deductionOrder),
+      termsSource: "llm_extracted_then_edited",
+      termsConfirmedByVenueAt: d.ts,
+      createdAt: d.ts,
+    });
+    ticketSalesToInsert.push({
+      id: `ts_${showId}`,
+      showId,
+      qty: 620,
+      gross: 19840,
+      fees: 1984,
+      capturedAt: d.ts,
+    });
+    // Expenses are intentionally pushed ABOVE the $2,500 cap so the
+    // inside/outside readings actually diverge — proves the capped_bucket
+    // schema does real work. Non-hospitality total = $2,200.
+    for (const [idx, e] of [
+      { category: "sound" as const, amount: 600 },
+      { category: "lights" as const, amount: 400 },
+      { category: "production" as const, amount: 800 },
+      { category: "hospitality" as const, amount: 400 },
+      { category: "backline" as const, amount: 400 },
+    ].entries()) {
+      expensesToInsert.push({
+        id: `exp_${showId}_${idx}`,
+        showId,
+        category: e.category,
+        amount: e.amount,
+        description: null,
+        approved: true,
+        absorbedByVenue: false,
+        enteredByUserId: MARIANA_ID,
+        enteredAt: d.ts,
+      });
+    }
+  }
+
+  // Demo 3: vs deal with walkout pot. After breakeven (guarantee + capped
+  // expenses), 100% of gross flows to the artist. This exercises the
+  // walkoutJson handler.
+  {
+    const d = demoDate(14);
+    const showId = "show_engine_demo_walkout";
+    const dealId = `deal_${showId}`;
+    showsToInsert.push({
+      id: showId,
+      venueId: VENUE_ID,
+      artistId: ARTIST_DEFS[0].id, // any A-tier artist
+      date: d.iso,
+      status: "advanced",
+      doorsTime: "19:00",
+      setTime: "20:30",
+      roomConfig: "standing",
+      internalNotes:
+        "Engine demo: vs deal with walkout pot — 100% of gross above breakeven flows to artist. Tests walkoutJson handler.",
+      createdAt: d.ts,
+    });
+    const walkout = {
+      basis: "gross",
+      breakevenFormula: "guarantee+expenses",
+      potThreshold: null,
+      artistShareAbove: 1.0,
+    };
+    const deductionOrder = [
+      { kind: "line_item", id: "fees", ref: { type: "fees" } },
+      {
+        kind: "capped_bucket",
+        id: "venue_expenses",
+        capRef: "expenseCap",
+        members: [
+          {
+            kind: "line_item",
+            id: "expenses",
+            ref: { type: "all_expenses_except_recoups" },
+          },
+        ],
+      },
+      { kind: "apply_percentage", basis: "net" },
+    ];
+    dealsToInsert.push({
+      id: dealId,
+      showId,
+      dealType: "vs",
+      guaranteeAmount: 4000,
+      percentage: 0.85,
+      percentageBasis: "net",
+      expenseCap: 1800,
+      hospitalityCap: 400,
+      bonusesJson: null,
+      walkoutJson: JSON.stringify(walkout),
+      deductionOrderJson: JSON.stringify(deductionOrder),
+      dealNotesFreetext:
+        "$4,000 vs 85% net + walkout pot. After breakeven on guarantee + expenses, all incremental gross goes to artist. Expense cap $1,800, hosp $400.",
+      termsSource: "llm_extracted_then_edited",
+      termsConfirmedByVenueAt: d.ts,
+      createdAt: d.ts,
+    });
+    ticketSalesToInsert.push({
+      id: `ts_${showId}`,
+      showId,
+      qty: 580,
+      gross: 17400,
+      fees: 1740,
+      capturedAt: d.ts,
+    });
+    for (const [idx, e] of [
+      { category: "sound" as const, amount: 380 },
+      { category: "lights" as const, amount: 200 },
+      { category: "production" as const, amount: 240 },
+      { category: "hospitality" as const, amount: 400 },
+      { category: "backline" as const, amount: 200 },
+    ].entries()) {
+      expensesToInsert.push({
+        id: `exp_${showId}_${idx}`,
+        showId,
+        category: e.category,
+        amount: e.amount,
+        description: null,
+        approved: true,
+        absorbedByVenue: false,
+        enteredByUserId: MARIANA_ID,
+        enteredAt: d.ts,
+      });
+    }
+  }
+
+  // Demo 4: vs deal with a capacity-pct ratchet. Base 70% net escalates
+  // to 80% net over 80% capacity. Tests ratchetJson handler.
+  {
+    const d = demoDate(21);
+    const showId = "show_engine_demo_ratchet";
+    const dealId = `deal_${showId}`;
+    showsToInsert.push({
+      id: showId,
+      venueId: VENUE_ID,
+      artistId: ARTIST_DEFS[1].id,
+      date: d.iso,
+      status: "advanced",
+      doorsTime: "19:00",
+      setTime: "20:30",
+      roomConfig: "standing",
+      internalNotes:
+        "Engine demo: vs deal with capacity-pct ratchet. Base 70% net, ratchets to 80% over 80% capacity. Tests ratchetJson handler.",
+      createdAt: d.ts,
+    });
+    const ratchet = {
+      basePercentage: 0.7,
+      basis: "net",
+      tiers: [
+        {
+          triggerType: "capacity_pct",
+          triggerValue: 0.8,
+          newPercentage: 0.8,
+        },
+      ],
+    };
+    const deductionOrder = [
+      { kind: "line_item", id: "fees", ref: { type: "fees" } },
+      {
+        kind: "capped_bucket",
+        id: "venue_expenses",
+        capRef: "expenseCap",
+        members: [
+          {
+            kind: "line_item",
+            id: "expenses",
+            ref: { type: "all_expenses_except_recoups" },
+          },
+        ],
+      },
+      { kind: "apply_percentage", basis: "net" },
+    ];
+    dealsToInsert.push({
+      id: dealId,
+      showId,
+      dealType: "vs",
+      guaranteeAmount: 3000,
+      percentage: 0.7,
+      percentageBasis: "net",
+      expenseCap: 1500,
+      hospitalityCap: 350,
+      bonusesJson: null,
+      ratchetJson: JSON.stringify(ratchet),
+      deductionOrderJson: JSON.stringify(deductionOrder),
+      dealNotesFreetext:
+        "$3,000 g'tee with escalator: 70% net at base, ratchets to 80% over 80% capacity. Expense cap $1,500, hosp $350.",
+      termsSource: "llm_extracted_then_edited",
+      termsConfirmedByVenueAt: d.ts,
+      createdAt: d.ts,
+    });
+    ticketSalesToInsert.push({
+      id: `ts_${showId}`,
+      showId,
+      qty: 540, // > 80% of 650-cap → ratchet triggers
+      gross: 16200,
+      fees: 1620,
+      capturedAt: d.ts,
+    });
+    for (const [idx, e] of [
+      { category: "sound" as const, amount: 350 },
+      { category: "lights" as const, amount: 180 },
+      { category: "production" as const, amount: 220 },
+      { category: "hospitality" as const, amount: 340 },
+      { category: "backline" as const, amount: 180 },
+    ].entries()) {
+      expensesToInsert.push({
+        id: `exp_${showId}_${idx}`,
+        showId,
+        category: e.category,
+        amount: e.amount,
+        description: null,
+        approved: true,
+        absorbedByVenue: false,
+        enteredByUserId: MARIANA_ID,
+        enteredAt: d.ts,
+      });
+    }
+  }
 
   // Bulk insert
   console.log(`   Inserting ${showsToInsert.length} shows…`);

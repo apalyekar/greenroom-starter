@@ -48,7 +48,7 @@ export default async function SettlePage({
   const data = await getShowById(id);
   if (!data) notFound();
 
-  const { show, artist, deal, ticketSales, expenses, settlement, recoups } =
+  const { show, artist, deal, ticketSales, expenses, comps, settlement, recoups } =
     data;
 
   if (!deal) {
@@ -66,6 +66,7 @@ export default async function SettlePage({
     deal,
     ticketSales,
     expenses,
+    comps,
     venueCapacity: data.venue?.capacity ?? undefined,
   });
   const grossSoFar = ticketSales.reduce((sum, t) => sum + t.gross, 0);
@@ -531,6 +532,47 @@ function SupportedSettlement({
         )}
       </div>
 
+      {/* Preliminary banner — Phase-1: deals don't seal until magic-link ships */}
+      {!calc.dealTermsConfirmed && (
+        <div className="mb-4 flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-[13px] text-amber-900">
+          <span className="font-medium">Preliminary settlement</span>
+          <span>
+            Deal terms haven&apos;t been confirmed by the agent yet
+            ({calc.preliminaryConfidence} confidence). Calculation is provisional.
+          </span>
+        </div>
+      )}
+
+      {/* Lines the engine refused to compute */}
+      {calc.linesSkipped.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Needs resolution before settling</CardTitle>
+            <CardDescription>
+              The engine refused to compute these lines rather than guess.
+              Resolve them on the deal sheet, then re-open the worksheet.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="divide-y divide-ink-100/80">
+            {calc.linesSkipped.map((l, i) => (
+              <div
+                key={i}
+                className="py-3 flex items-start justify-between gap-4"
+              >
+                <div className="min-w-0">
+                  <div className="text-[13px] font-medium text-amber-900">
+                    {l.label}
+                  </div>
+                  <div className="text-[12px] text-ink-600 mt-0.5">
+                    {l.reason}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
       {/* Worksheet breakdown */}
       <Card accent="brand">
         <CardHeader>
@@ -546,11 +588,26 @@ function SupportedSettlement({
             label="Gross box office"
             value={formatMoney(calc.grossBoxOffice)}
           />
-          <Row label="Net box office" value={formatMoney(calc.netBoxOffice)} />
           <Row
-            label="Total expenses (passed through)"
-            value={formatMoney(calc.totalExpenses)}
+            label="Gross less fees"
+            value={formatMoney(calc.grossLessFees)}
           />
+          <Row
+            label="Approved expenses (raw)"
+            value={formatMoney(calc.rawExpenses)}
+            note={
+              calc.cappedExpenses !== calc.rawExpenses
+                ? `$${calc.cappedExpenses.toLocaleString()} after cap; $${calc.expenseOverage.toLocaleString()} absorbed`
+                : undefined
+            }
+          />
+          {calc.pendingExpenses > 0 && (
+            <Row
+              label="Pending approval (excluded)"
+              value={formatMoney(calc.pendingExpenses)}
+              note="Not counted in headline number. Approve expenses on the show detail to include."
+            />
+          )}
           <div className="pt-3" />
           {calc.steps.map((step, i) => (
             <Row

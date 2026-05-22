@@ -125,11 +125,40 @@ export const deals = sqliteTable("deals", {
   bonusesJson: text("bonuses_json"),
   dealNotesFreetext: text("deal_notes_freetext"),
 
+  // -------- Deal Sheet additions (per capture spec §4.1 + §4.2) --------
+  walkoutJson: text("walkout_json"),
+  ratchetJson: text("ratchet_json"),
+  deductionOrderJson: text("deduction_order_json"),
+  recoupsAtDealTimeJson: text("recoups_at_deal_time_json"),
+
+  termsSource: text("terms_source", {
+    enum: ["manual", "llm_extracted", "llm_extracted_then_edited"],
+  })
+    .notNull()
+    .default("manual"),
+  currentExtractionId: text("current_extraction_id"),
+  currentDealSheetVersion: integer("current_deal_sheet_version")
+    .notNull()
+    .default(0),
+  termsConfirmedByVenueAt: integer("terms_confirmed_by_venue_at", {
+    mode: "timestamp",
+  }),
+  termsConfirmedByAgentAt: integer("terms_confirmed_by_agent_at", {
+    mode: "timestamp",
+  }),
+  termsSealedAt: integer("terms_sealed_at", { mode: "timestamp" }),
+
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
 // -------- Ticket sales --------
 
+/**
+ * Ticket sales are recorded as ADDITIVE rows — multiple rows per show
+ * accumulate. They are NOT snapshots replacing prior rows. Future work
+ * may add an `is_correction: boolean` flag if snapshot/replacement semantics
+ * become necessary, but Phase 1 assumes additive rows only.
+ */
 export const ticketSales = sqliteTable("ticket_sales", {
   id: text("id").primaryKey(),
   showId: text("show_id")
@@ -138,6 +167,15 @@ export const ticketSales = sqliteTable("ticket_sales", {
   qty: integer("qty").notNull(),
   gross: real("gross").notNull(),
   fees: real("fees").notNull(),
+  // Channel the sale came through. Defaults to "advance" — backfilled
+  // value for the existing 537 rows and the value the seed inserts
+  // for all generated rows. Door deals need "door" to compute
+  // door receipts correctly (see engine §7.3 in the capture spec).
+  source: text("source", {
+    enum: ["advance", "door", "platform_credit"],
+  })
+    .notNull()
+    .default("advance"),
   capturedAt: integer("captured_at", { mode: "timestamp" }).notNull(),
 });
 
@@ -281,6 +319,128 @@ export const settlements = sqliteTable("settlements", {
   notes: text("notes"),
 });
 
+// -------- Deal Sheet capture tables (per capture spec §4.3–§4.7) --------
+
+/**
+ * One row per LLM extraction attempt. Append-only; supersedes form a history.
+ * `status` transitions: draft → pending_confirmation → confirmed (or superseded/rejected).
+ */
+export const dealTermsExtraction = sqliteTable("deal_terms_extraction", {
+  id: text("id").primaryKey(),
+  dealId: text("deal_id")
+    .notNull()
+    .references(() => deals.id),
+  version: integer("version").notNull().default(1),
+  sourceText: text("source_text").notNull(),
+  sourceArtifactsJson: text("source_artifacts_json"),
+  extractedJson: text("extracted_json").notNull(),
+  mode: text("mode", { enum: ["live", "stub"] }).notNull().default("live"),
+  modelId: text("model_id"),
+  promptVersion: text("prompt_version").notNull().default("v1"),
+  confidence: real("confidence"),
+  status: text("status", {
+    enum: ["draft", "pending_confirmation", "confirmed", "superseded", "rejected"],
+  })
+    .notNull()
+    .default("draft"),
+  extractedAt: integer("extracted_at", { mode: "timestamp" }).notNull(),
+});
+
+/**
+ * One row per flagged ambiguity. Each carries a human-readable question
+ * the booker could send to the agent.
+ */
+export const dealAmbiguities = sqliteTable("deal_ambiguities", {
+  id: text("id").primaryKey(),
+  dealId: text("deal_id")
+    .notNull()
+    .references(() => deals.id),
+  extractionId: text("extraction_id")
+    .notNull()
+    .references(() => dealTermsExtraction.id),
+  category: text("category", {
+    enum: [
+      "recoup_placement",
+      "percentage_basis",
+      "expense_cap_scope",
+      "bonus_threshold_basis",
+      "comp_counting",
+      "deduction_order",
+      "missing_source",
+      "stale_structured_field",
+      "other",
+    ],
+  }).notNull(),
+  proseSpan: text("prose_span").notNull(),
+  proseSpanStart: integer("prose_span_start").notNull().default(0),
+  proseSpanEnd: integer("prose_span_end").notNull().default(0),
+  question: text("question").notNull(),
+  optionsJson: text("options_json"),
+  resolution: text("resolution"),
+  resolvedBy: text("resolved_by"),
+  resolvedAt: integer("resolved_at", { mode: "timestamp" }),
+  resolutionEvidence: text("resolution_evidence"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+});
+
+/**
+ * One row per confirmation event per party. A "sealed" Deal Sheet has
+ * one row with party=venue and one with party=agent for the current extraction.
+ */
+export const dealConfirmations = sqliteTable("deal_confirmations", {
+  id: text("id").primaryKey(),
+  dealId: text("deal_id")
+    .notNull()
+    .references(() => deals.id),
+  extractionId: text("extraction_id")
+    .notNull()
+    .references(() => dealTermsExtraction.id),
+  party: text("party", {
+    enum: ["venue", "agent", "artist_management"],
+  }).notNull(),
+  contactId: text("contact_id").notNull(),
+  confirmedAt: integer("confirmed_at", { mode: "timestamp" }).notNull(),
+  confirmationMethod: text("confirmation_method", {
+    enum: ["in_app", "magic_link", "email_reply", "verbal_logged"],
+  })
+    .notNull()
+    .default("in_app"),
+  fieldsConfirmedJson: text("fields_confirmed_json"),
+});
+
+/**
+ * One row per venue. Holds BYOK LLM credentials. The plaintext API key
+ * is never returned by any query after creation — only `apiKeyLastFour`
+ * is exposed for verification.
+ *
+ * NOTE: In Phase 1 the apiKey field stores the key as-is for prototype use.
+ * Production would store an encrypted blob; this is documented as a known
+ * scope cut in the capture spec §4.7.
+ */
+export const venueLlmSettings = sqliteTable("venue_llm_settings", {
+  venueId: text("venue_id")
+    .primaryKey()
+    .references(() => venues.id),
+  provider: text("provider", { enum: ["anthropic", "openai"] })
+    .notNull()
+    .default("anthropic"),
+  modelId: text("model_id").notNull().default("claude-opus-4-7"),
+  apiKey: text("api_key"),
+  apiKeyLastFour: text("api_key_last_four"),
+  configuredByUserId: text("configured_by_user_id").references(() => users.id),
+  configuredAt: integer("configured_at", { mode: "timestamp" }),
+  lastSuccessfulCallAt: integer("last_successful_call_at", {
+    mode: "timestamp",
+  }),
+  lastFailureReason: text("last_failure_reason"),
+  monthlyExtractionCount: integer("monthly_extraction_count")
+    .notNull()
+    .default(0),
+  monthlyExtractionResetAt: integer("monthly_extraction_reset_at", {
+    mode: "timestamp",
+  }),
+});
+
 // -------- Type exports for convenience --------
 
 export type User = typeof users.$inferSelect;
@@ -294,6 +454,10 @@ export type TicketSale = typeof ticketSales.$inferSelect;
 export type Comp = typeof comps.$inferSelect;
 export type Expense = typeof expenses.$inferSelect;
 export type Settlement = typeof settlements.$inferSelect;
+export type DealTermsExtraction = typeof dealTermsExtraction.$inferSelect;
+export type DealAmbiguity = typeof dealAmbiguities.$inferSelect;
+export type DealConfirmation = typeof dealConfirmations.$inferSelect;
+export type VenueLlmSettings = typeof venueLlmSettings.$inferSelect;
 
 // -------- Decoded JSON helpers --------
 
@@ -330,6 +494,68 @@ export type Recoup = {
   label: string;
   amount: number;
   status: "agreed" | "disputed" | "withdrawn";
+};
+
+/**
+ * deductionOrderJson shape (capture spec §4.2). The capped_bucket is the
+ * load-bearing structure — it expresses "these line items count against the
+ * expense cap; anything not listed here is outside the cap." Both the capture
+ * writeback (lib/extraction/writeback.ts) and the settlement engine
+ * (lib/dealMath.ts) consume this type — it's exported here to keep them
+ * single-sourced.
+ */
+export type DeductionStep =
+  | {
+      kind: "line_item";
+      id: string;
+      ref:
+        | { type: "fees" }
+        | { type: "recoup"; recoupId: string }
+        | { type: "expense_categories"; categories: ExpenseCategory[] }
+        | { type: "all_expenses_except_recoups" };
+    }
+  | {
+      kind: "capped_bucket";
+      id: string;
+      capRef: "expenseCap" | "hospitalityCap";
+      members: DeductionStep[];
+    }
+  | { kind: "apply_percentage"; basis: "gross" | "net" };
+
+export type ExpenseCategory =
+  | "production"
+  | "sound"
+  | "lights"
+  | "hospitality"
+  | "marketing"
+  | "backline"
+  | "security"
+  | "other";
+
+/**
+ * walkoutJson shape (capture spec §4.2 + §7.5.2). A null breakevenFormula
+ * means the prose was ambiguous about how breakeven is computed — the
+ * engine refuses to compute the walkout line and emits linesSkipped.
+ */
+export type Walkout = {
+  basis: "gross" | "net";
+  breakevenFormula: "guarantee+expenses" | "guarantee_only" | null;
+  potThreshold: number | null;
+  artistShareAbove: number;
+};
+
+/**
+ * ratchetJson shape (capture spec §4.2 + §7.5.3). Replaces (not adds to)
+ * the base percentage when a tier's trigger is met.
+ */
+export type Ratchet = {
+  basePercentage: number;
+  basis: "gross" | "net";
+  tiers: {
+    triggerType: "capacity_pct" | "gross_amount" | "attendance" | "net_amount";
+    triggerValue: number;
+    newPercentage: number;
+  }[];
 };
 
 export type SettlementStage = Settlement["status"];
